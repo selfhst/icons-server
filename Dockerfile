@@ -1,10 +1,13 @@
-FROM golang:1.26.3-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS builder
+
+ARG TARGETOS TARGETARCH TARGETVARIANT
 
 WORKDIR /app
 
 COPY go.mod main.go ./
 
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o server .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} \
+    go build -ldflags="-s -w" -o server .
 
 FROM scratch
 

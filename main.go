@@ -1,17 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +26,17 @@ const (
 	logLevelDebug = 0
 	logLevelInfo  = 1
 	logLevelError = 2
+)
+
+const (
+	svgType  = "image/svg+xml"
+	webpType = "image/webp"
+
+	maxRemoteBody = 10 << 20
+
+	maxMissTTL = 60 * time.Second
+
+	svgCSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
 )
 
 type Config struct {
@@ -38,14 +52,27 @@ type Config struct {
 	LogLevel      int
 }
 
-type CacheItem struct {
-	Content     string
-	ContentType string
-	Timestamp   time.Time
+type entry struct {
+	body        []byte
+	gz          []byte
+	contentType string
+	etag        string
+	stored      time.Time
+}
+
+func newEntry(body []byte, contentType, etag string) *entry {
+	if etag == "" {
+		etag = computeETag(body)
+	}
+	e := &entry{body: body, contentType: contentType, etag: etag}
+	if contentType == svgType {
+		e.gz = gzipBytes(body)
+	}
+	return e
 }
 
 type Cache struct {
-	items map[string]CacheItem
+	items map[string]*entry
 	mutex sync.RWMutex
 	ttl   time.Duration
 	max   int
@@ -53,89 +80,65 @@ type Cache struct {
 
 func NewCache(ttl time.Duration, maxSize int) *Cache {
 	return &Cache{
-		items: make(map[string]CacheItem),
+		items: make(map[string]*entry),
 		ttl:   ttl,
 		max:   maxSize,
 	}
 }
 
-func (c *Cache) Get(key string) (CacheItem, bool) {
+func (c *Cache) Get(key string) (*entry, bool) {
 	c.mutex.RLock()
-	item, exists := c.items[key]
+	e, exists := c.items[key]
 	c.mutex.RUnlock()
 
 	if !exists {
-		return CacheItem{}, false
+		return nil, false
 	}
 
-	if time.Since(item.Timestamp) > c.ttl {
+	if time.Since(e.stored) > c.ttl {
 		c.mutex.Lock()
-		if current, exists := c.items[key]; exists && time.Since(current.Timestamp) > c.ttl {
+		if c.items[key] == e {
 			delete(c.items, key)
 		}
 		c.mutex.Unlock()
-		return CacheItem{}, false
+		return nil, false
 	}
 
-	return item, true
+	return e, true
 }
 
 func (c *Cache) cleanup() {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	for k, v := range c.items {
-		if time.Since(v.Timestamp) > c.ttl {
+		if time.Since(v.stored) > c.ttl {
 			delete(c.items, k)
 		}
 	}
 }
 
-func (c *Cache) Set(key, content, contentType string) {
+func (c *Cache) Set(key string, e *entry) {
+	e.stored = time.Now()
+
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if len(c.items) >= c.max {
+	if _, replacing := c.items[key]; !replacing && len(c.items) >= c.max {
 		var oldestKey string
 		var oldestTime time.Time
 		first := true
 
 		for k, v := range c.items {
-			if first || v.Timestamp.Before(oldestTime) {
+			if first || v.stored.Before(oldestTime) {
 				oldestKey = k
-				oldestTime = v.Timestamp
+				oldestTime = v.stored
 				first = false
 			}
 		}
 		delete(c.items, oldestKey)
 	}
 
-	c.items[key] = CacheItem{
-		Content:     content,
-		ContentType: contentType,
-		Timestamp:   time.Now(),
-	}
-}
-
-var (
-	config     *Config
-	cache      *Cache
-	httpClient *http.Client
-)
-
-// whiteVal matches any way an SVG can express white as a color value:
-// 3/4/6/7/8-digit hex, the "white" keyword, or rgb()/rgba() of 255,255,255.
-const whiteVal = `#fff(?:[0-9a-fA-F]|fff[0-9a-fA-F]{0,2})?|white|rgba?\(\s*255\s*[,\s]\s*255\s*[,\s]\s*255\s*(?:[,/]\s*[0-9.]+%?\s*)?\)`
-
-var (
-	hexColorRe  = regexp.MustCompile(`^[0-9A-Fa-f]{6}$`)
-	reColorProp = regexp.MustCompile(`(?i)(fill|stop-color):(\s*)(` + whiteVal + `)([\s;}/),"']|$)`)
-	reColorAttr = regexp.MustCompile(`(?i)(fill|stop-color)=(["'])(` + whiteVal + `)(["'])`)
-)
-
-func logf(level int, format string, args ...any) {
-	if level >= config.LogLevel {
-		log.Printf(format, args...)
-	}
+	c.items[key] = e
 }
 
 func formatDuration(d time.Duration) string {
@@ -145,10 +148,18 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.2fms", float64(d)/float64(time.Millisecond))
 }
 
-func computeETag(content string) string {
+func computeETag(content []byte) string {
 	h := fnv.New64a()
-	h.Write([]byte(content))
+	h.Write(content)
 	return fmt.Sprintf(`"%x"`, h.Sum64())
+}
+
+func gzipBytes(b []byte) []byte {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	zw.Write(b)
+	zw.Close()
+	return buf.Bytes()
 }
 
 func parseIntEnv(name string, def int) int {
@@ -174,7 +185,7 @@ func loadConfig() *Config {
 		iconSource = "remote"
 	}
 
-	remoteURL := os.Getenv("REMOTE_URL")
+	remoteURL := strings.TrimRight(os.Getenv("REMOTE_URL"), "/")
 	if remoteURL == "" {
 		remoteURL = "https://cdn.jsdelivr.net/gh/selfhst/icons@main"
 	}
@@ -190,7 +201,7 @@ func loadConfig() *Config {
 		corsAllowedOrigins = "*"
 	}
 	var corsOrigins []string
-	for _, o := range strings.Split(corsAllowedOrigins, ",") {
+	for o := range strings.SplitSeq(corsAllowedOrigins, ",") {
 		if trimmed := strings.TrimSpace(o); trimmed != "" {
 			corsOrigins = append(corsOrigins, trimmed)
 		}
@@ -224,24 +235,6 @@ func loadConfig() *Config {
 	}
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(config.CORSOrigins) == 1 && config.CORSOrigins[0] == "*" {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-		} else {
-			origin := r.Header.Get("Origin")
-			for _, allowed := range config.CORSOrigins {
-				if origin == allowed {
-					w.Header().Set("Access-Control-Allow-Origin", origin)
-					w.Header().Add("Vary", "Origin")
-					break
-				}
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 func validateConfig(cfg *Config) {
 	if cfg.IconSource != "local" && cfg.IconSource != "remote" && cfg.IconSource != "hybrid" {
 		log.Fatalf("[ERROR] Invalid ICON_SOURCE \"%s\": must be \"local\", \"remote\", or \"hybrid\"", cfg.IconSource)
@@ -260,54 +253,25 @@ func validateConfig(cfg *Config) {
 	}
 	for _, origin := range cfg.CORSOrigins {
 		if origin != "*" && !strings.HasPrefix(origin, "http://") && !strings.HasPrefix(origin, "https://") {
-			log.Printf("[WARN] CORS_ALLOWED_ORIGINS entry \"%s\" is missing a scheme — did you mean \"https://%s\"?", origin, origin)
+			log.Printf("[WARN] CORS_ALLOWED_ORIGINS entry \"%s\" is missing a scheme, did you mean \"https://%s\"?", origin, origin)
 		}
 	}
+}
+
+func isHex(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c|0x20 && c|0x20 <= 'f'
 }
 
 func isValidHexColor(color string) bool {
-	return hexColorRe.MatchString(color)
-}
-
-func parseIconName(iconName string) (string, string) {
-	ext := strings.ToLower(filepath.Ext(iconName))
-	if ext != "" {
-		format := strings.TrimPrefix(ext, ".")
-		switch format {
-		case "svg", "png", "webp", "avif", "ico":
-			return strings.TrimSuffix(iconName, filepath.Ext(iconName)), format
-		default:
-			logf(logLevelError, "[WARN] Unrecognized extension \"%s\" in icon name \"%s\", serving webp instead", ext, iconName)
-			return strings.TrimSuffix(iconName, filepath.Ext(iconName)), "webp"
+	if len(color) != 6 {
+		return false
+	}
+	for i := range len(color) {
+		if !isHex(color[i]) {
+			return false
 		}
 	}
-	return iconName, "webp"
-}
-
-func readLocalFile(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-func fetchRemoteFile(url string) (string, error) {
-	resp, err := httpClient.Get(url)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
+	return true
 }
 
 func hexRGB(code string) (int64, int64, int64) {
@@ -317,25 +281,24 @@ func hexRGB(code string) (int64, int64, int64) {
 	return r, g, b
 }
 
-// newWhite returns the replacement for a matched white value, preserving any
-// alpha channel from the original (8-digit hex, #rgba shorthand, or rgba()).
 func newWhite(value, hexColor, code string) string {
 	v := strings.ToLower(value)
 	switch {
 	case strings.HasPrefix(v, "#"):
 		h := v[1:]
 		switch len(h) {
-		case 4: // #rgba shorthand: expand the single alpha nibble
+		case 4:
 			return hexColor + strings.Repeat(string(h[3]), 2)
-		case 7: // odd 7-digit form: expand trailing nibble
+		case 7:
 			return hexColor + strings.Repeat(string(h[6]), 2)
-		case 8: // #rrggbbaa: keep the alpha byte
+		case 8:
 			return hexColor + h[6:8]
-		default: // 3 or 6 digits: fully opaque
+		default:
 			return hexColor
 		}
 	case strings.HasPrefix(v, "rgba("):
-		inner := value[strings.Index(value, "(")+1 : strings.LastIndex(value, ")")]
+		_, inner, _ := strings.Cut(value, "(")
+		inner, _, _ = strings.CutLast(inner, ")")
 		parts := strings.FieldsFunc(inner, func(r rune) bool {
 			return r == ',' || r == '/' || r == ' ' || r == '\t'
 		})
@@ -344,51 +307,173 @@ func newWhite(value, hexColor, code string) string {
 			return fmt.Sprintf("rgba(%d, %d, %d, %s)", r, g, b, parts[len(parts)-1])
 		}
 		return hexColor
-	default: // "white" keyword or rgb() with no alpha
+	default:
 		return hexColor
 	}
 }
 
-func applySVGColor(svgContent, colorCode string) string {
+func applySVGColor(svg, colorCode string) string {
 	hexColor := "#" + colorCode
-
-	svgContent = reColorProp.ReplaceAllStringFunc(svgContent, func(m string) string {
-		g := reColorProp.FindStringSubmatch(m)
-		return g[1] + ":" + g[2] + newWhite(g[3], hexColor, colorCode) + g[4]
-	})
-	svgContent = reColorAttr.ReplaceAllStringFunc(svgContent, func(m string) string {
-		g := reColorAttr.FindStringSubmatch(m)
-		return g[1] + "=" + g[2] + newWhite(g[3], hexColor, colorCode) + g[4]
-	})
-
-	return svgContent
+	var b strings.Builder
+	last := 0
+	for i := 0; i < len(svg); i++ {
+		c := svg[i] | 0x20
+		if c != 'f' && c != 's' {
+			continue
+		}
+		start, end, ok := matchWhiteAt(svg, i)
+		if !ok {
+			continue
+		}
+		if last == 0 {
+			b.Grow(len(svg) + 64)
+		}
+		b.WriteString(svg[last:start])
+		b.WriteString(newWhite(svg[start:end], hexColor, colorCode))
+		last = end
+		i = end
+	}
+	if last == 0 {
+		return svg
+	}
+	b.WriteString(svg[last:])
+	return b.String()
 }
 
-func serveContent(w http.ResponseWriter, r *http.Request, contentType, content string) {
-	if contentType == "image/svg+xml" && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-		gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
-		if err == nil {
-			w.Header().Set("Content-Encoding", "gzip")
-			w.Header().Set("Vary", "Accept-Encoding")
-			defer gz.Close()
-			io.WriteString(gz, content)
-			return
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
+}
+
+func isSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r'
+}
+
+func isQuote(c byte) bool { return c == '"' || c == '\'' }
+
+func isCSSEnd(c byte) bool {
+	return isSpace(c) || strings.IndexByte(`;}/),"'`, c) >= 0
+}
+
+func matchWhiteAt(s string, i int) (start, end int, ok bool) {
+	j := i
+	switch {
+	case hasPrefixFold(s[j:], "fill"):
+		j += len("fill")
+	case hasPrefixFold(s[j:], "stop-color"):
+		j += len("stop-color")
+	default:
+		return 0, 0, false
+	}
+	if j >= len(s) {
+		return 0, 0, false
+	}
+	switch s[j] {
+	case '=':
+		j++
+		if j >= len(s) || !isQuote(s[j]) {
+			return 0, 0, false
+		}
+		start = j + 1
+		end = whiteEnd(s, start)
+		if end < 0 || end >= len(s) || !isQuote(s[end]) {
+			return 0, 0, false
+		}
+	case ':':
+		j++
+		for j < len(s) && isSpace(s[j]) {
+			j++
+		}
+		start = j
+		end = whiteEnd(s, start)
+		if end < 0 || end < len(s) && !isCSSEnd(s[end]) {
+			return 0, 0, false
+		}
+	default:
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
+func whiteEnd(s string, i int) int {
+	if i >= len(s) {
+		return -1
+	}
+	switch {
+	case s[i] == '#':
+		j := i + 1
+		for j < len(s) && isHex(s[j]) {
+			j++
+		}
+		h := s[i+1 : j]
+		switch {
+		case (len(h) == 3 || len(h) == 4) && strings.EqualFold(h[:3], "fff"),
+			len(h) >= 6 && len(h) <= 8 && strings.EqualFold(h[:6], "ffffff"):
+			return j
+		}
+		return -1
+	case hasPrefixFold(s[i:], "white"):
+		return i + len("white")
+	case s[i]|0x20 == 'r':
+		return rgbWhiteEnd(s, i)
+	}
+	return -1
+}
+
+func rgbWhiteEnd(s string, i int) int {
+	j := i
+	switch {
+	case hasPrefixFold(s[j:], "rgba("):
+		j += len("rgba(")
+	case hasPrefixFold(s[j:], "rgb("):
+		j += len("rgb(")
+	default:
+		return -1
+	}
+	skip := func() {
+		for j < len(s) && isSpace(s[j]) {
+			j++
 		}
 	}
-	io.WriteString(w, content)
-}
+	for n := range 3 {
+		skip()
+		if !strings.HasPrefix(s[j:], "255") {
+			return -1
+		}
+		j += 3
+		if n == 2 {
+			break
+		}
 
-func writeIconResponse(w http.ResponseWriter, r *http.Request, contentType, content, cacheStatus string) {
-	etag := computeETag(content)
-	if r.Header.Get("If-None-Match") == etag {
-		w.WriteHeader(http.StatusNotModified)
-		return
+		from := j
+		skip()
+		if j < len(s) && s[j] == ',' {
+			j++
+		}
+		skip()
+		if j == from {
+			return -1
+		}
 	}
-	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(config.CacheTTL.Seconds())))
-	w.Header().Set("ETag", etag)
-	w.Header().Set("X-Cache", cacheStatus)
-	serveContent(w, r, contentType, content)
+	skip()
+	if j < len(s) && (s[j] == ',' || s[j] == '/') {
+		j++
+		skip()
+		from := j
+		for j < len(s) && (s[j] >= '0' && s[j] <= '9' || s[j] == '.') {
+			j++
+		}
+		if j == from {
+			return -1
+		}
+		if j < len(s) && s[j] == '%' {
+			j++
+		}
+		skip()
+	}
+	if j >= len(s) || s[j] != ')' {
+		return -1
+	}
+	return j + 1
 }
 
 func getContentType(format string) string {
@@ -396,13 +481,13 @@ func getContentType(format string) string {
 	case "png":
 		return "image/png"
 	case "webp":
-		return "image/webp"
+		return webpType
 	case "avif":
 		return "image/avif"
 	case "ico":
 		return "image/x-icon"
 	case "svg":
-		return "image/svg+xml"
+		return svgType
 	case "jpg", "jpeg":
 		return "image/jpeg"
 	case "gif":
@@ -419,7 +504,255 @@ func getCacheKey(iconName, colorCode string) string {
 	return iconName + ":" + colorCode
 }
 
-func handleIcon(w http.ResponseWriter, r *http.Request) {
+func acceptsGzip(header string) bool {
+	for part := range strings.SplitSeq(header, ",") {
+		coding, params, _ := strings.Cut(part, ";")
+		coding = strings.TrimSpace(coding)
+		if !strings.EqualFold(coding, "gzip") && !strings.EqualFold(coding, "x-gzip") {
+			continue
+		}
+		for p := range strings.SplitSeq(params, ";") {
+			k, v, _ := strings.Cut(p, "=")
+			if strings.EqualFold(strings.TrimSpace(k), "q") {
+				if q, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && q == 0 {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func etagMatches(header, etag string) bool {
+	if header == "" {
+		return false
+	}
+	for part := range strings.SplitSeq(header, ",") {
+		t := strings.TrimSpace(part)
+		if t == "*" || strings.TrimPrefix(t, "W/") == etag {
+			return true
+		}
+	}
+	return false
+}
+
+type httpStatusError struct{ code int }
+
+func (e *httpStatusError) Error() string { return fmt.Sprintf("HTTP %d", e.code) }
+
+func isNotFound(err error) bool {
+	if se, ok := errors.AsType[*httpStatusError](err); ok {
+		return se.code == http.StatusNotFound || se.code == http.StatusGone
+	}
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+type source struct {
+	name     string
+	get      func(dir, file string) ([]byte, error)
+	upstream bool
+}
+
+type flight struct {
+	mu    sync.Mutex
+	calls map[string]*call
+}
+
+type call struct {
+	wg  sync.WaitGroup
+	res result
+}
+
+func (f *flight) do(key string, fn func() result) (res result, shared bool) {
+	f.mu.Lock()
+	if c, ok := f.calls[key]; ok {
+		f.mu.Unlock()
+		c.wg.Wait()
+		return c.res, true
+	}
+	c := &call{}
+	c.wg.Add(1)
+	f.calls[key] = c
+	f.mu.Unlock()
+
+	defer func() {
+		f.mu.Lock()
+		delete(f.calls, key)
+		f.mu.Unlock()
+		c.wg.Done()
+	}()
+	c.res = fn()
+	return c.res, false
+}
+
+type result struct {
+	status     int
+	e          *entry
+	format     string
+	servedFrom string
+}
+
+type server struct {
+	cfg          *Config
+	cache        *Cache
+	misses       *Cache
+	flight       flight
+	client       *http.Client
+	sources      []source
+	cacheControl string
+}
+
+func newServer(cfg *Config) *server {
+	s := &server{
+		cfg:          cfg,
+		cache:        NewCache(cfg.CacheTTL, cfg.CacheSize),
+		misses:       NewCache(min(cfg.CacheTTL, maxMissTTL), cfg.CacheSize),
+		flight:       flight{calls: map[string]*call{}},
+		client:       &http.Client{Timeout: cfg.RemoteTimeout},
+		cacheControl: fmt.Sprintf("public, max-age=%d", int(cfg.CacheTTL.Seconds())),
+	}
+	if cfg.IconSource == "local" || cfg.IconSource == "hybrid" {
+		s.sources = append(s.sources, source{"local", s.readLocal, false})
+	}
+	if cfg.IconSource == "remote" || cfg.IconSource == "hybrid" {
+		s.sources = append(s.sources, source{"remote", s.fetchRemote, true})
+	}
+	return s
+}
+
+func (s *server) logf(level int, format string, args ...any) {
+	if level >= s.cfg.LogLevel {
+		log.Printf(format, args...)
+	}
+}
+
+func (s *server) readLocal(dir, file string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(s.cfg.LocalPath, dir, file))
+}
+
+func (s *server) fetchRemote(dir, file string) ([]byte, error) {
+	resp, err := s.client.Get(s.cfg.RemoteURL + "/" + dir + "/" + url.PathEscape(file))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, &httpStatusError{resp.StatusCode}
+	}
+	if resp.ContentLength > maxRemoteBody {
+		return nil, fmt.Errorf("body of %d bytes is over the %d limit", resp.ContentLength, maxRemoteBody)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxRemoteBody+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxRemoteBody {
+		return nil, fmt.Errorf("body is over the %d byte limit", maxRemoteBody)
+	}
+	return data, nil
+}
+
+func (s *server) load(src source, dir, file string) (data []byte, failed bool) {
+	data, err := src.get(dir, file)
+	if err != nil {
+		if isNotFound(err) {
+			s.logf(logLevelDebug, "[DEBUG] Not found: %q (%s)", dir+"/"+file, src.name)
+			return nil, false
+		}
+		s.logf(logLevelError, "[ERROR] Failed to read %q (%s): %v", dir+"/"+file, src.name, err)
+		return nil, src.upstream
+	}
+	return data, false
+}
+
+func (s *server) resolve(baseName, format, colorCode string) result {
+	contentType := getContentType(format)
+	failed := false
+	load := func(src source, dir, file string) []byte {
+		b, f := s.load(src, dir, file)
+		failed = failed || f
+		return b
+	}
+
+	for _, src := range s.sources {
+		var body []byte
+		if colorCode != "" {
+			if light := load(src, "svg", baseName+"-light.svg"); len(light) > 0 {
+				body = []byte(applySVGColor(string(light), colorCode))
+			}
+		} else {
+			body = load(src, format, baseName+"."+format)
+			if len(body) == 0 && format != "webp" {
+				if body = load(src, "webp", baseName+".webp"); len(body) > 0 {
+					contentType = webpType
+					format = "webp"
+				}
+			}
+		}
+		if len(body) > 0 {
+			return result{status: http.StatusOK, e: newEntry(body, contentType, ""), format: format, servedFrom: src.name}
+		}
+	}
+	if failed {
+		return result{status: http.StatusBadGateway}
+	}
+	return result{status: http.StatusNotFound}
+}
+
+func (s *server) parseIconName(iconName string) (string, string) {
+	ext := strings.ToLower(filepath.Ext(iconName))
+	if ext != "" {
+		format := strings.TrimPrefix(ext, ".")
+		switch format {
+		case "svg", "png", "webp", "avif", "ico":
+			return strings.TrimSuffix(iconName, filepath.Ext(iconName)), format
+		default:
+			s.logf(logLevelError, "[WARN] Unrecognized extension %q in icon name %q, serving webp instead", ext, iconName)
+			return strings.TrimSuffix(iconName, filepath.Ext(iconName)), "webp"
+		}
+	}
+	return iconName, "webp"
+}
+
+func badName(name string) bool {
+	return strings.Contains(name, "..") || strings.ContainsAny(name, `/\`)
+}
+
+func (s *server) notModified(w http.ResponseWriter, r *http.Request, etag, contentType string) bool {
+	h := w.Header()
+	h.Set("Cache-Control", s.cacheControl)
+	h.Set("ETag", etag)
+	if contentType == svgType {
+		h.Add("Vary", "Accept-Encoding")
+		h.Set("Content-Security-Policy", svgCSP)
+	}
+	if etagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+	return false
+}
+
+func (s *server) writeEntry(w http.ResponseWriter, r *http.Request, e *entry, cacheStatus string) {
+	w.Header().Set("X-Cache", cacheStatus)
+	if s.notModified(w, r, e.etag, e.contentType) {
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", e.contentType)
+	body := e.body
+	if e.gz != nil && acceptsGzip(r.Header.Get("Accept-Encoding")) {
+		h.Set("Content-Encoding", "gzip")
+		body = e.gz
+	}
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	w.Write(body)
+}
+
+func (s *server) handleIcon(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	iconName := r.PathValue("iconname")
 	colorCode := r.PathValue("colorcode")
@@ -429,11 +762,11 @@ func handleIcon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	baseName, format := parseIconName(iconName)
+	baseName, format := s.parseIconName(iconName)
 	baseName = strings.ToLower(baseName)
 
-	if strings.Contains(baseName, "..") || strings.Contains(baseName, "/") || strings.Contains(baseName, "\\") {
-		logf(logLevelError, "[ERROR] Invalid icon name, path traversal attempt: \"%s\"", iconName)
+	if badName(baseName) {
+		s.logf(logLevelError, "[ERROR] Invalid icon name, path traversal attempt: %q", iconName)
 		http.Error(w, "Invalid icon name", http.StatusBadRequest)
 		return
 	}
@@ -444,27 +777,22 @@ func handleIcon(w http.ResponseWriter, r *http.Request) {
 
 	primaryFallback := false
 	if colorCode == "primary" {
-		if config.PrimaryColor == "" {
+		if s.cfg.PrimaryColor == "" {
 			primaryFallback = true
 		}
-		colorCode = config.PrimaryColor
+		colorCode = s.cfg.PrimaryColor
 	}
 
 	if colorCode != "" && !isValidHexColor(colorCode) {
-		logf(logLevelError, "[ERROR] Invalid color code for icon \"%s\": %s", baseName, colorCode)
+		s.logf(logLevelError, "[ERROR] Invalid color code for icon %q: %q", baseName, colorCode)
 		http.Error(w, "Invalid color code. Use 6-digit hex without #", http.StatusBadRequest)
 		return
 	}
+	colorCode = strings.ToUpper(colorCode)
 
-	var contentType string
-	var formatToServe string
-
+	formatToServe := format
 	if colorCode != "" {
-		contentType = "image/svg+xml"
 		formatToServe = "svg"
-	} else {
-		formatToServe = format
-		contentType = getContentType(formatToServe)
 	}
 
 	cacheKey := getCacheKey(baseName+"."+formatToServe, colorCode)
@@ -474,82 +802,44 @@ func handleIcon(w http.ResponseWriter, r *http.Request) {
 		colorSuffix = " with color " + colorCode
 	}
 
-	if cached, found := cache.Get(cacheKey); found {
-		logf(logLevelDebug, "[CACHE] Serving cached icon: \"%s\"%s (%s) %v", baseName, colorSuffix, formatToServe, formatDuration(time.Since(start)))
-		writeIconResponse(w, r, cached.ContentType, cached.Content, "HIT")
+	if cached, found := s.cache.Get(cacheKey); found {
+		s.logf(logLevelDebug, "[CACHE] Serving cached icon: %q%s (%s) %v", baseName, colorSuffix, formatToServe, formatDuration(time.Since(start)))
+		s.writeEntry(w, r, cached, "HIT")
 		return
 	}
-
-	var iconContent string
-	var servedFrom string
-
-	if config.IconSource == "local" || config.IconSource == "hybrid" {
-		if colorCode != "" {
-			lightPath := filepath.Join(config.LocalPath, "svg", baseName+"-light.svg")
-			if content, err := readLocalFile(lightPath); err == nil {
-				iconContent = applySVGColor(content, colorCode)
-				servedFrom = "local"
-			}
-		} else {
-			var standardPath string
-			if formatToServe == "svg" {
-				standardPath = filepath.Join(config.LocalPath, "svg", baseName+".svg")
-			} else {
-				standardPath = filepath.Join(config.LocalPath, formatToServe, baseName+"."+formatToServe)
-			}
-			iconContent, _ = readLocalFile(standardPath)
-
-			if iconContent == "" && formatToServe != "webp" {
-				webpPath := filepath.Join(config.LocalPath, "webp", baseName+".webp")
-				if content, err := readLocalFile(webpPath); err == nil {
-					iconContent = content
-					contentType = "image/webp"
-					formatToServe = "webp"
-				}
-			}
-			if iconContent != "" {
-				servedFrom = "local"
-			}
-		}
-	}
-
-	if iconContent == "" && (config.IconSource == "remote" || config.IconSource == "hybrid") {
-		if colorCode != "" {
-			lightURL := config.RemoteURL + "/svg/" + baseName + "-light.svg"
-			if content, err := fetchRemoteFile(lightURL); err == nil {
-				iconContent = applySVGColor(content, colorCode)
-				servedFrom = "remote"
-			}
-		} else {
-			var standardURL string
-			if formatToServe == "svg" {
-				standardURL = config.RemoteURL + "/svg/" + baseName + ".svg"
-			} else {
-				standardURL = config.RemoteURL + "/" + formatToServe + "/" + baseName + "." + formatToServe
-			}
-			iconContent, _ = fetchRemoteFile(standardURL)
-
-			if iconContent == "" && formatToServe != "webp" {
-				webpURL := config.RemoteURL + "/webp/" + baseName + ".webp"
-				if content, err := fetchRemoteFile(webpURL); err == nil {
-					iconContent = content
-					contentType = "image/webp"
-					formatToServe = "webp"
-				}
-			}
-			if iconContent != "" {
-				servedFrom = "remote"
-			}
-		}
-	}
-
-	if iconContent == "" {
-		logf(logLevelError, "[ERROR] Icon not found: \"%s\"%s (source: %s) %v", baseName, colorSuffix, config.IconSource, formatDuration(time.Since(start)))
+	if _, found := s.misses.Get(cacheKey); found {
+		s.logf(logLevelDebug, "[CACHE] Icon not found (cached): %q%s %v", baseName, colorSuffix, formatDuration(time.Since(start)))
+		w.Header().Set("X-Cache", "HIT")
 		http.Error(w, "Icon not found", http.StatusNotFound)
 		return
 	}
 
-	cache.Set(cacheKey, iconContent, contentType)
+	res, shared := s.flight.do(cacheKey, func() result {
+		res := s.resolve(baseName, formatToServe, colorCode)
+		switch res.status {
+		case http.StatusOK:
+			s.cache.Set(cacheKey, res.e)
+		case http.StatusNotFound:
+			s.misses.Set(cacheKey, &entry{})
+		}
+		return res
+	})
+	via := ""
+	if shared {
+		via = ", shared"
+	}
+
+	w.Header().Set("X-Cache", "MISS")
+	switch res.status {
+	case http.StatusNotFound:
+		s.logf(logLevelError, "[ERROR] Icon not found: %q%s (source: %s%s) %v", baseName, colorSuffix, s.cfg.IconSource, via, formatDuration(time.Since(start)))
+		http.Error(w, "Icon not found", http.StatusNotFound)
+		return
+	case http.StatusBadGateway:
+		s.logf(logLevelError, "[ERROR] Upstream failed for icon: %q%s (source: %s%s) %v", baseName, colorSuffix, s.cfg.IconSource, via, formatDuration(time.Since(start)))
+		http.Error(w, "Upstream error", http.StatusBadGateway)
+		return
+	}
 
 	level := "SUCCESS"
 	detail := colorSuffix
@@ -557,12 +847,12 @@ func handleIcon(w http.ResponseWriter, r *http.Request) {
 		level = "WARN"
 		detail = " (PRIMARY_COLOR not set, using default format)"
 	}
-	logf(logLevelInfo, "[%s] Serving icon: \"%s\"%s (%s, source: %s) %v", level, baseName, detail, formatToServe, servedFrom, formatDuration(time.Since(start)))
+	s.logf(logLevelInfo, "[%s] Serving icon: %q%s (%s, source: %s%s) %v", level, baseName, detail, res.format, res.servedFrom, via, formatDuration(time.Since(start)))
 
-	writeIconResponse(w, r, contentType, iconContent, "MISS")
+	s.writeEntry(w, r, res.e, "MISS")
 }
 
-func handleCustomIcon(w http.ResponseWriter, r *http.Request) {
+func (s *server) handleCustomIcon(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	filename := r.PathValue("filename")
 
@@ -571,16 +861,17 @@ func handleCustomIcon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.Contains(filename, "..") || strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
-		logf(logLevelError, "[ERROR] Invalid custom icon filename, path traversal attempt: \"%s\"", filename)
+	if badName(filename) {
+		s.logf(logLevelError, "[ERROR] Invalid custom icon filename, path traversal attempt: %q", filename)
 		http.Error(w, "Invalid filename", http.StatusBadRequest)
 		return
 	}
 
 	filename = strings.ToLower(filename)
+	customDir := filepath.Join(s.cfg.LocalPath, "custom")
 
 	actualFilename := filename
-	if entries, err := os.ReadDir(filepath.Join(config.LocalPath, "custom")); err == nil {
+	if entries, err := os.ReadDir(customDir); err == nil {
 		for _, entry := range entries {
 			if strings.ToLower(entry.Name()) == filename {
 				actualFilename = entry.Name()
@@ -589,79 +880,75 @@ func handleCustomIcon(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	customPath := filepath.Join(config.LocalPath, "custom", actualFilename)
+	customPath := filepath.Join(customDir, actualFilename)
 
 	stat, err := os.Stat(customPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			logf(logLevelError, "[ERROR] Custom icon not found: \"%s\" %v", filename, formatDuration(time.Since(start)))
+			s.logf(logLevelError, "[ERROR] Custom icon not found: %q %v", filename, formatDuration(time.Since(start)))
 			http.Error(w, "Custom icon not found", http.StatusNotFound)
 		} else {
-			logf(logLevelError, "[ERROR] Failed to read custom icon \"%s\": %v (%v)", filename, err, formatDuration(time.Since(start)))
+			s.logf(logLevelError, "[ERROR] Failed to read custom icon %q: %v (%v)", filename, err, formatDuration(time.Since(start)))
 			http.Error(w, "Failed to read custom icon", http.StatusInternalServerError)
 		}
 		return
 	}
 
-	etag := fmt.Sprintf(`"%d-%d"`, stat.ModTime().Unix(), stat.Size())
-	if r.Header.Get("If-None-Match") == etag {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-
-	ext := strings.ToLower(filepath.Ext(filename))
-	contentType := getContentType(strings.TrimPrefix(ext, "."))
+	contentType := getContentType(strings.TrimPrefix(strings.ToLower(filepath.Ext(filename)), "."))
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
 
+	etag := fmt.Sprintf(`"%d-%d"`, stat.ModTime().Unix(), stat.Size())
+	if s.notModified(w, r, etag, contentType) {
+		return
+	}
+
 	cacheKey := "custom:" + filename + ":" + etag
-	if cached, found := cache.Get(cacheKey); found {
-		logf(logLevelDebug, "[CACHE] Serving cached custom icon: \"%s\" %v", filename, formatDuration(time.Since(start)))
-		w.Header().Set("Content-Type", cached.ContentType)
-		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(config.CacheTTL.Seconds())))
-		w.Header().Set("ETag", etag)
-		w.Header().Set("X-Cache", "HIT")
-		serveContent(w, r, cached.ContentType, cached.Content)
+	if cached, found := s.cache.Get(cacheKey); found {
+		s.logf(logLevelDebug, "[CACHE] Serving cached custom icon: %q %v", filename, formatDuration(time.Since(start)))
+		s.writeEntry(w, r, cached, "HIT")
 		return
 	}
 
 	data, err := os.ReadFile(customPath)
 	if err != nil {
-		logf(logLevelError, "[ERROR] Failed to read custom icon \"%s\": %v (%v)", filename, err, formatDuration(time.Since(start)))
+		s.logf(logLevelError, "[ERROR] Failed to read custom icon %q: %v (%v)", filename, err, formatDuration(time.Since(start)))
 		http.Error(w, "Failed to read custom icon", http.StatusInternalServerError)
 		return
 	}
 
-	cache.Set(cacheKey, string(data), contentType)
+	e := newEntry(data, contentType, etag)
+	s.cache.Set(cacheKey, e)
 
-	logf(logLevelInfo, "[SUCCESS] Serving custom icon: \"%s\" (%s) %v", filename, contentType, formatDuration(time.Since(start)))
+	s.logf(logLevelInfo, "[SUCCESS] Serving custom icon: %q (%s) %v", filename, contentType, formatDuration(time.Since(start)))
 
-	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(config.CacheTTL.Seconds())))
-	w.Header().Set("ETag", etag)
-	w.Header().Set("X-Cache", "MISS")
-	serveContent(w, r, contentType, string(data))
+	s.writeEntry(w, r, e, "MISS")
 }
 
-func main() {
-	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
-		port := os.Getenv("PORT")
-		if port == "" {
-			port = "4050"
-		}
-		resp, err := http.Get("http://localhost:" + port + "/health")
-		if err != nil || resp.StatusCode != http.StatusOK {
-			os.Exit(1)
-		}
-		os.Exit(0)
+func headers(origins []string, next http.Handler) http.Handler {
+	if len(origins) == 1 && origins[0] == "*" {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			next.ServeHTTP(w, r)
+		})
 	}
+	allowed := make(map[string]bool, len(origins))
+	for _, o := range origins {
+		allowed[o] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Add("Vary", "Origin")
+		if origin := r.Header.Get("Origin"); allowed[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
-	config = loadConfig()
-	validateConfig(config)
-	cache = NewCache(config.CacheTTL, config.CacheSize)
-	httpClient = &http.Client{Timeout: config.RemoteTimeout}
-
+func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
@@ -677,15 +964,43 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	mux.HandleFunc("GET /custom/{filename}", handleCustomIcon)
+	mux.HandleFunc("GET /custom/{filename}", s.handleCustomIcon)
 
-	// Suppress favicon load error message in logs when viewing via browser
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	mux.HandleFunc("GET /{iconname}/{colorcode}", handleIcon)
-	mux.HandleFunc("GET /{iconname}", handleIcon)
+	mux.HandleFunc("GET /{iconname}/{colorcode}", s.handleIcon)
+	mux.HandleFunc("GET /{iconname}", s.handleIcon)
+
+	return headers(s.cfg.CORSOrigins, mux)
+}
+
+func healthcheck() int {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "4050"
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://localhost:" + port + "/health")
+	if err != nil {
+		return 1
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 1
+	}
+	return 0
+}
+
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		os.Exit(healthcheck())
+	}
+
+	config := loadConfig()
+	validateConfig(config)
+	s := newServer(config)
 
 	log.Printf("Icon server listening on port %s", config.Port)
 	log.Printf("Icon source: %s", func() string {
@@ -703,7 +1018,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:         ":" + config.Port,
-		Handler:      corsMiddleware(mux),
+		Handler:      s.routes(),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -719,7 +1034,8 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				cache.cleanup()
+				s.cache.cleanup()
+				s.misses.cleanup()
 			case <-cleanupCtx.Done():
 				return
 			}
