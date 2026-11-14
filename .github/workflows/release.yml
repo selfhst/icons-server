@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'An existing tag to build and release again'
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: selfhst/icons
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+    - name: Checkout the tag
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.tag || github.ref }}
+
+    - name: Read the version
+      id: version
+      run: |
+        TAG="${{ github.event.inputs.tag || github.ref_name }}"
+        VERSION="${TAG#v}"
+        FILE=$(tr -d '\n' < VERSION)
+        if [ "$VERSION" != "$FILE" ]; then
+          echo "::error::Tag $TAG does not match VERSION ($FILE)"
+          exit 1
+        fi
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "minor=$(echo "$VERSION" | cut -d. -f1-2)" >> "$GITHUB_OUTPUT"
+        echo "major=$(echo "$VERSION" | cut -d. -f1)" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to the container registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value=${{ steps.version.outputs.version }}
+          type=raw,value=${{ steps.version.outputs.minor }}
+          type=raw,value=${{ steps.version.outputs.major }}
+          type=raw,value=latest
+        labels: |
+          org.opencontainers.image.title=selfh.st/icons
+          org.opencontainers.image.description=Self-hosted icon server with custom color support
+          org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.licenses=MIT
+
+    - name: Build and push the image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64,linux/arm/v7
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Draft the release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TAG="${{ steps.version.outputs.tag }}"
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          echo "A release for $TAG already exists; left as it is."
+        else
+          gh release create "$TAG" --draft --title "$TAG" --notes "" --verify-tag
+        fi
