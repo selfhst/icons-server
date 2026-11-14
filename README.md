@@ -23,7 +23,7 @@ The following architectures are supported by this image. Docker will automatical
 
 ## Icon Files
 
-This image is configured to reference remote icon files by default. For local asset hosting, consider obtaining the [selfhst/icon](https://github.com/selfhst/icons) collection using one of the following options:
+This image is configured to reference remote icon files by default. For local asset hosting, consider obtaining the [selfhst/icons](https://github.com/selfhst/icons) collection using one of the following options:
 
 * rsync
 * Cloning the repository to a local folder
