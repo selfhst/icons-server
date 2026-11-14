@@ -30,12 +30,11 @@ jobs:
       id: version
       run: |
         TAG="${{ github.event.inputs.tag || github.ref_name }}"
-        VERSION="${TAG#v}"
-        FILE=$(tr -d '\n' < VERSION)
-        if [ "$VERSION" != "$FILE" ]; then
-          echo "::error::Tag $TAG does not match VERSION ($FILE)"
+        if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "::error::$TAG is not a version tag like v4.1.0"
           exit 1
         fi
+        VERSION="${TAG#v}"
         echo "tag=$TAG" >> "$GITHUB_OUTPUT"
         echo "version=$VERSION" >> "$GITHUB_OUTPUT"
         echo "minor=$(echo "$VERSION" | cut -d. -f1-2)" >> "$GITHUB_OUTPUT"
